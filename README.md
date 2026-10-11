@@ -8,6 +8,51 @@ Esqueleto de proyecto, listo para clonar y empezar a escribir pipelines. Trae to
 - Imagen custom de Airflow con Java 17 + binarios de Spark ya instalados, para que `SparkSubmitOperator` funcione sin configuración extra.
 - Soporte opcional para **Google Cloud** (GCS + BigQuery) desde Airflow y desde Spark.
 
+## Arquitectura
+
+```mermaid
+flowchart LR
+  user(["Navegador / CLI"])
+  gcp["Google Cloud (opcional)<br/>GCS · BigQuery"]
+
+  subgraph host["Host · Docker Compose"]
+    subgraph airflow["Airflow 3.3.1 · CeleryExecutor"]
+      api["airflow-apiserver<br/>UI + API :8080"]
+      sched["airflow-scheduler"]
+      dagproc["airflow-dag-processor"]
+      trig["airflow-triggerer"]
+      worker["airflow-worker-1<br/>Celery worker + driver de Spark<br/>Spark UI :4040"]
+    end
+
+    pg[("postgres<br/>metadata DB")]
+    redis[("redis<br/>broker de Celery")]
+
+    subgraph spark["Spark 4.1.3 · standalone"]
+      master["spark-master<br/>UI :8081 · RPC :7077"]
+      workers["spark-worker x2<br/>executors"]
+    end
+
+    vol[/"Carpetas montadas<br/>dags · spark · src · sql · data · gcp"/]
+  end
+
+  user --> api
+  airflow --- pg
+  sched -->|"encola tasks"| redis
+  redis -->|"consume tasks"| worker
+  worker -->|"spark-submit<br/>deploy_mode=client"| master
+  master -->|"asigna executors"| workers
+  workers <-->|"tasks / resultados"| worker
+  worker -.-> gcp
+  workers -.-> gcp
+  vol -.- airflow
+  vol -.- spark
+```
+
+- El **scheduler** encola las tasks en Redis y el **worker de Celery** las ejecuta; el estado vive en Postgres.
+- Una task con `SparkSubmitOperator` lanza `spark-submit` desde `airflow-worker-1`, que pasa a ser el **driver** del job (`deploy_mode=client`); el **master** reparte el trabajo entre los **executors** de `spark-worker`.
+- `spark/`, `src/`, `sql/`, `data/` y `gcp/` se montan tanto en Airflow como en Spark, así driver y executors ven el mismo código y los mismos paths; `dags/` solo en Airflow.
+- El acceso a GCS/BigQuery sale del driver y de los executors, con la key de `gcp/key.json`.
+
 ## Requisitos
 
 - Docker >= 24 y Docker Compose v2 (`docker compose`, no `docker-compose`).
