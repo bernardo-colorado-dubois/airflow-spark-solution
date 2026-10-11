@@ -1,0 +1,5 @@
+{
+  "sqltools.useNodeRuntime": true,
+  "python.defaultInterpreterPath": "${workspaceFolder}/venv/bin/python",
+  "jupyter.notebookFileRoot": "${workspaceFolder}"
+}

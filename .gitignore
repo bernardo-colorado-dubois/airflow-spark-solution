@@ -1,0 +1,38 @@
+# Airflow runtime artifacts
+logs/*
+!logs/.gitkeep
+plugins/*
+!plugins/.gitkeep
+config/*
+!config/.gitkeep
+config/airflow.cfg
+
+# Spark output data
+data/*
+!data/.gitkeep
+
+# Spark connector jars (downloaded by `make gcp-jars`, don't commit binaries)
+spark/jars/*
+!spark/jars/.gitkeep
+
+# GCP service account key(s) — never commit real credentials
+gcp/*
+!gcp/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Jupyter — checkpoints locales, no aportan nada versionados
+.ipynb_checkpoints/
+
+# Docker / OS
+.DS_Store
+*.log
+
+# Secrets — .env tiene credenciales reales (Fernet key, JWT secret, Postgres,
+# API keys propias), nunca commitear
+.env
+.env.local

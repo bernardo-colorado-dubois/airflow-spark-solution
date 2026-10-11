@@ -1,0 +1,29 @@
+# Dependencias para un venv local (autocompletado / que el IDE no marque error,
+# y kernel de Jupyter para correr notebooks desde VS Code — ver notebooks/).
+# NO se usa dentro de los contenedores — eso lo maneja requirements.txt + Dockerfile.
+#
+# Requiere Python 3.10 (debe coincidir con PYTHON_VERSION en .env, ver CLAUDE.md)
+# solo si este venv se usa para correr Spark contra el cluster dockerizado.
+# Para Spark en modo local (local[*]) no aplica: driver y "executor" son el
+# mismo proceso, alcanza con el Python que traiga el host.
+#
+# Instalar con las constraints oficiales de Airflow (evita conflictos de resolución):
+#   python3 -m venv venv
+#   source venv/bin/activate
+#   pip install -r local-requirements.txt \
+#     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.3.1/constraints-3.10.txt"
+#   pip install --force-reinstall --no-deps pyspark==4.1.3   # ver CLAUDE.md, punto 11
+
+apache-airflow==3.3.1
+apache-airflow-providers-apache-spark>=6.3.2
+apache-airflow-providers-google>=15
+
+# PySpark client — debe coincidir con SPARK_VERSION en .env
+pyspark==4.1.3
+
+pandas>=2.2
+pendulum
+
+# Kernel de Jupyter para que VS Code corra notebooks/*.ipynb con este venv
+# como intérprete — sin levantar un servidor de Jupyter (ver notebooks/).
+ipykernel>=6.29

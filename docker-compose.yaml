@@ -1,0 +1,390 @@
+---
+# =============================================================================
+# Airflow (CeleryExecutor) + Spark (standalone cluster) — plug & play
+# =============================================================================
+# Quick start:
+#   make init      # first-time DB migration + admin user
+#   make up        # start everything
+#   make ps        # check health
+# Airflow UI  -> http://localhost:8080  (user/pass from .env, default airflow/airflow)
+# Spark UI    -> http://localhost:8081  (master)  /  8082+ (workers)
+# Flower UI   -> make flower  -> http://localhost:5555
+# =============================================================================
+
+# Caps container stdout/stderr logs so a chatty service (e.g. SparkSubmitOperator
+# with verbose=True) can never fill the host disk — old runs will report failures
+# like "No space left on device" instead if this cap is ever removed.
+x-logging:
+  &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    args:
+      AIRFLOW_VERSION: ${AIRFLOW_VERSION}
+      PYTHON_VERSION: ${PYTHON_VERSION}
+      SPARK_VERSION: ${SPARK_VERSION}
+  image: ${AIRFLOW_IMAGE_NAME}
+  env_file:
+    - .env
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CELERY__WORKER_CONCURRENCY: ${AIRFLOW_WORKER_CONCURRENCY}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # Plug-and-play Spark connection, picked up automatically at init time
+    AIRFLOW_CONN_SPARK_DEFAULT: 'spark://spark-master:7077?deploy_mode=client'
+    # Sin extra a propósito: el provider de google resuelve por ADC vía
+    # GOOGLE_APPLICATION_CREDENTIALS (ver abajo) -- pero el hook igual exige que la
+    # Connection exista (AirflowNotFoundException si falta), no alcanza con la env
+    # var sola. Confirmado en vivo con BigQueryCreateEmptyDatasetOperator.
+    AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: 'google-cloud-platform://'
+    # Pin driver/executor Python explicitly so a future image bump can't
+    # silently reintroduce a PYTHON_VERSION_MISMATCH between Airflow and Spark.
+    PYSPARK_PYTHON: python3
+    PYSPARK_DRIVER_PYTHON: python3
+    _PIP_ADDITIONAL_REQUIREMENTS: ''
+    # Google Cloud auth (Airflow's google provider + the Spark GCS/BigQuery
+    # connectors) — Application Default Credentials picked up from this file.
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp/key.json
+    # /opt/src (mounted below) holds the "src" package shared by DAGs and
+    # Spark jobs — /opt on the path so `import src.module` resolves the
+    # same way here and on spark-master/spark-worker (see CLAUDE.md).
+    PYTHONPATH: /opt
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/spark:/opt/spark-apps
+    - ${AIRFLOW_PROJ_DIR:-.}/src:/opt/src
+    - ${AIRFLOW_PROJ_DIR:-.}/sql:/opt/sql
+    - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/spark-data
+    - ${AIRFLOW_PROJ_DIR:-.}/gcp:/opt/gcp:ro
+    - ${AIRFLOW_PROJ_DIR:-.}/spark-conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+  logging: *default-logging
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks: [stack]
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------------
+  # Backing services
+  # ---------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "${POSTGRES_CPU_LIMIT}"
+          memory: ${POSTGRES_MEM_LIMIT}
+    restart: always
+    networks: [stack]
+
+  redis:
+    image: redis:7.2-bookworm
+    expose:
+      - 6379
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${REDIS_CPU_LIMIT}"
+          memory: ${REDIS_MEM_LIMIT}
+    restart: always
+    networks: [stack]
+
+  # ---------------------------------------------------------------------
+  # Spark standalone cluster
+  # ---------------------------------------------------------------------
+  spark-master:
+    build:
+      context: .
+      dockerfile: spark.Dockerfile
+      args:
+        SPARK_BASE_IMAGE: ${SPARK_IMAGE_NAME}
+    image: ${SPARK_CUSTOM_IMAGE_NAME}
+    container_name: spark-master
+    user: root
+    # umask 000: files/dirs Spark writes to the shared ./data volume
+    # come out world read/write/execute, so the Airflow driver (different
+    # UID) can overwrite/delete them on the next run without permission errors.
+    entrypoint: ["/bin/bash", "-c", "umask 000 && exec /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master"]
+    ports:
+      - "${SPARK_MASTER_WEBUI_PORT}:8080"   # Spark master web UI
+      - "${SPARK_MASTER_PORT}:7077"         # Spark master RPC (spark://)
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      PYSPARK_PYTHON: python3
+      GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp/key.json
+      PYTHONPATH: /opt
+    volumes:
+      - ./spark:/opt/spark-apps
+      - ./src:/opt/src
+      - ./sql:/opt/sql
+      - ./data:/opt/spark-data
+      - ./gcp:/opt/gcp:ro
+      - ./spark-conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "${SPARK_MASTER_CPU_LIMIT}"
+          memory: ${SPARK_MASTER_MEM_LIMIT}
+    restart: always
+    networks: [stack]
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: spark.Dockerfile
+      args:
+        SPARK_BASE_IMAGE: ${SPARK_IMAGE_NAME}
+    image: ${SPARK_CUSTOM_IMAGE_NAME}
+    user: root
+    entrypoint: ["/bin/bash", "-c", "umask 000 && exec /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://${SPARK_MASTER_HOST}:${SPARK_MASTER_PORT}"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY}
+      SPARK_WORKER_WEBUI_PORT: 8081
+      PYSPARK_PYTHON: python3
+      GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp/key.json
+      PYTHONPATH: /opt
+    volumes:
+      - ./spark:/opt/spark-apps
+      - ./src:/opt/src
+      - ./sql:/opt/sql
+      - ./data:/opt/spark-data
+      - ./gcp:/opt/gcp:ro
+    logging: *default-logging
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "${SPARK_WORKER_CORES}"
+          memory: ${SPARK_WORKER_MEMORY}
+    restart: always
+    networks: [stack]
+
+  # ---------------------------------------------------------------------
+  # Airflow control-plane
+  # ---------------------------------------------------------------------
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${AIRFLOW_APISERVER_CPU_LIMIT}"
+          memory: ${AIRFLOW_APISERVER_MEM_LIMIT}
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${AIRFLOW_SCHEDULER_CPU_LIMIT}"
+          memory: ${AIRFLOW_SCHEDULER_MEM_LIMIT}
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      # 10s no alcanza para levantar el CLI completo de Airflow con solo
+      # AIRFLOW_DAGPROCESSOR_CPU_LIMIT=0.3 cores -> healthcheck timeaba
+      # ("Health check exceeded timeout") aunque el proceso funcionaba bien.
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${AIRFLOW_DAGPROCESSOR_CPU_LIMIT}"
+          memory: ${AIRFLOW_DAGPROCESSOR_MEM_LIMIT}
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      # mismo motivo que dag-processor: 10s no alcanza con
+      # AIRFLOW_TRIGGERER_CPU_LIMIT=0.2 cores.
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${AIRFLOW_TRIGGERER_CPU_LIMIT}"
+          memory: ${AIRFLOW_TRIGGERER_MEM_LIMIT}
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------
+  # 1 dedicated Celery worker — 1 CPU / 4GB RAM.
+  # Defined explicitly (instead of `--scale`) so it gets its own
+  # resource limits, hostname and logs, which makes debugging much easier.
+  # ---------------------------------------------------------------------
+  airflow-worker-1: &airflow-worker
+    <<: *airflow-common
+    hostname: airflow-worker-1
+    command: celery worker
+    ports:
+      - "${SPARK_DRIVER_UI_PORT}:4040"   # Spark Application UI (driver corre acá en deploy_mode=client)
+    healthcheck:
+      test: ["CMD-SHELL", 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    deploy:
+      resources:
+        limits:
+          cpus: "${AIRFLOW_WORKER_CPU_LIMIT}"
+          memory: ${AIRFLOW_WORKER_MEM_LIMIT}
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-apiserver:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/{logs,dags,plugins,config}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles: ["debug"]
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command: ["bash", "-c", "airflow"]
+    depends_on:
+      <<: *airflow-common-depends-on
+
+  flower:
+    <<: *airflow-common
+    command: celery flower
+    profiles: ["flower"]
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+networks:
+  stack:
+    driver: bridge
+
+volumes:
+  postgres-db-volume:

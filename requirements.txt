@@ -1,0 +1,18 @@
+# Airflow provider needed to talk to the Spark cluster (SparkSubmitOperator, etc.)
+# Celery provider ships already with the base image's celery extra, no need to pin it here.
+apache-airflow-providers-apache-spark>=6.3.2
+
+# Google Cloud operators/hooks for Airflow (GCS, BigQuery, Dataproc, etc.).
+# Auth is via GOOGLE_APPLICATION_CREDENTIALS (see docker-compose.yaml / gcp/key.json).
+apache-airflow-providers-google>=15
+
+# PySpark client — MUST match SPARK_VERSION in .env / Dockerfile so the
+# driver (Airflow) and the cluster (spark-master/workers) speak the same protocol.
+pyspark==4.1.3
+
+# Handy extras for building real pipelines on top of this stack
+pandas>=2.2
+
+# Anything added below is installed on the Airflow image only (DAGs + Spark
+# driver). spark-master/spark-worker do NOT get it — executor-side libs go
+# in spark.Dockerfile (see CLAUDE.md "Decisiones no obvias", puntos 9 y 10).
